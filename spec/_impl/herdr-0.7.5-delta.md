@@ -1,662 +1,502 @@
-# Herdr 0.7.5 delta — required migration and implementation roadmap
+# Herdr 0.7.5+ redesign and implementation plan
 
-Status: proposed implementation plan
+Status: proposed redesign; not yet reflected in the current implementation
 Reviewed: 2026-07-26
-Baseline: orchestratr was designed and tested against Herdr 0.7.2 / protocol 16
-Target: Herdr 0.7.5 / protocol 17
+Baseline: orchestratr currently targets Herdr 0.7.2 / protocol 16
+Required runtime: Herdr 0.7.5 or newer, using the supported protocol-17 contract
 
-This document consolidates two independent reviews of Herdr 0.7.5 against the full
-orchestratr specification and implementation. It records verified facts, corrects stale
-assumptions, and orders the resulting work into must-have compatibility changes and
-optional enhancements.
+This document replaces the earlier compatibility-oriented migration plan. Orchestratr will
+not preserve Herdr 0.7.2 or protocol-16 behavior. The migration is a clean cut to Herdr's
+agent-automation APIs and removes terminal and lifecycle machinery that Herdr now owns.
+
+`spec/spec.md` remains the source of truth for behavior implemented today. This document is
+the ordered change proposal from that baseline. Normative spec sections are updated only as
+their corresponding implementation phases land.
 
 The governing boundary is:
 
-> Herdr owns terminal topology, live-agent identity, safe input, and raw lifecycle facts.
-> Orchestratr continues to own durable orchestration: paths and history, admission control,
-> per-turn semantics, transcripts, aggregate waits, GC, loops, reconciliation, and SDKs.
+> Herdr owns live terminal and agent mechanics. Orchestratr owns durable orchestration.
+
+In practical terms, Herdr owns topology operations, agent launch/readiness, live occupant
+identity, prompt submission, raw lifecycle state, occupant-safe waits and key delivery,
+stable terminal attachment, and detection diagnostics. Orchestratr owns paths and history,
+queueing, concurrency, persisted turns, transcript-backed responses, aggregate waits, GC,
+reconciliation, loops, its socket API, SDKs, and user-facing orchestration policy.
 
 ---
 
-## 1. Executive decision
+## 1. Locked decisions
 
-Herdr 0.7.5 is not a drop-in upgrade for the current driver. Protocol 17 changes
-`agent.start` incompatibly and introduces strict live-agent names. Orchestratr must complete
-the P0 migration below before claiming 0.7.5 support.
+### 1.1 Herdr support starts at 0.7.5
 
-Once migrated, orchestratr should delegate two delicate operations to Herdr:
+Orchestratr requires all of the following:
 
-1. Agent launch readiness and live-occupant identity.
-2. Atomic prompt submission and agent-scoped key delivery.
+- Herdr binary version **0.7.5 or newer**.
+- Herdr socket protocol **17**, the protocol shipped by 0.7.5.
+- The protocol-17 request/result shapes checked into orchestratr's conformance fixture.
 
-Herdr's new `agent.wait` and terminal reads must not replace orchestratr's durable turn and
-transcript model. Herdr explicitly documents that its waits are status-based rather than
-turn-scoped, and that alternate-screen terminal history can be irretrievable.
+There is no protocol-16 driver, fallback spawn path, compatibility flag, or degraded mode.
+Herdr 0.7.4 and older fail before any store or terminal mutation.
 
-### Priority meanings
+“0.7.5+” is a minimum product version, not permission to guess future socket shapes. A later
+Herdr release works automatically while it still advertises protocol 17 and satisfies the
+contract fixture. A future protocol bump fails closed until orchestratr deliberately adds and
+tests that protocol.
 
-| priority | meaning |
-| --- | --- |
-| **P0 — must have** | Required for correctness and compatibility with Herdr 0.7.5. Do before any feature work. |
-| **P1 — should have** | Immediate reliability or simplification enabled by the new API. Target the same release as the migration when practical. |
-| **P2 — good to have** | Low-risk product improvements that exploit the richer Herdr surface. |
-| **P3 — exploratory** | Larger design changes requiring a separate proposal or performance evidence. |
+### 1.2 Orchestratr has supported providers, not installable integrations
 
----
+There is no `orcr integration add`, `orcr integration install`, plugin registry, or runtime
+provider loader. Provider behavior ships in the orchestratr binary.
 
-## 2. Verified Herdr 0.7.5 facts
+The initial supported-provider catalog is exactly:
 
-The following were checked against the installed `herdr 0.7.5`, its protocol-17 schema,
-official documentation, release notes, and source.
-
-| capability | verified 0.7.5 behavior | orchestratr impact |
+| provider | orchestratr support | required Herdr prerequisite |
 | --- | --- | --- |
-| Protocol | Socket protocol is **17**. | The protocol-16 contract and conformance fixture are stale. |
-| `agent.start` | Params are `{name, kind, pane_id, args?, timeout_ms?}`. It requires an existing available shell pane and does not create or move topology. The raw socket call starts a managed launch; clients observe `launch_pending` / `interactive_ready`. | Current `{argv,cwd,env,workspace_id,...}` request is invalid. Orchestratr must create a tab/pane first and inject env there. |
-| Agent name | Live alias must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents. It is cleared when the occupant exits, is released, or is replaced. | A full orchestratr path cannot be the Herdr name because paths contain `/` and may be much longer. |
-| `agent.prompt` | Atomically submits text plus encoded Enter, honors live bracketed-paste mode, validates the current agent occupant, and may optionally wait. | Replaces pane `send_text` + delay + Enter for prompts. |
-| `agent.wait` | Server-owned and event-driven; pins the resolved occupant so a replacement cannot satisfy the wait. Defaults to `idle`, `done`, or `blocked`. | Useful as a live substrate, but not a replacement for durable turn tracking. |
-| Prompt wait | When prompting from a non-working state, Herdr requires a lifecycle change within five seconds or returns `agent_prompt_stalled`. It does not track individual turns. If already working, completion of that active turn may satisfy the wait. | Do not equate it with `orcr agent wait`; use cautiously for delivery/activity confirmation only. |
-| `agent.send_keys` | Sends validated logical keys such as `esc` and `ctrl+c` only if the target agent still owns the pane. | Enables safe interrupt/stop controls and safer graceful-shutdown recipes. |
-| `AgentInfo` | Adds `launch_pending`, `interactive_ready`, `state_change_seq`, metadata tokens, and richer terminal-title fields. | Can simplify startup and fast-turn bookkeeping. |
-| `agent.view.set/clear` | Installs a transient filter/sort projection for Herdr's built-in Agents view. It controls sidebar/mobile/navigation ordering only. | Useful for native UI integration. It has no relationship to alternate-screen capture. |
-| `pane/workspace.report_metadata` | Display-only metadata and tokens can be shown in Herdr rows and queried by agent views. | Orchestratr can expose paths, models, parents, loops, and status in Herdr's UI. |
-| Stable attach | `herdr terminal attach <terminal_id> [--takeover]` targets the move-stable terminal directly. | Removes the pane-locator refresh race. Current `agent attach <terminal_id>` is invalid in 0.7.5. |
-| State authority | Many agents use bundled/remote screen manifests. Claude and Codex integrations primarily provide native session identity, not lifecycle authority. | The spec's “integration required for state” explanation is incorrect. |
-| Detection manifests | Bundled manifests can be superseded by remotely updated compatible manifests or local overrides; `agent.explain` reports source, version, evidence, matched rule, and fallback. | Detection behavior can drift independently of the Herdr binary and should be diagnosable. |
-| `HERDR_AGENT` | Linux/macOS foreground-process hint identifies agents hidden behind wrappers; macOS support is new in 0.7.5. | Likely useful for the enterprise Claude wrapper problem. |
-| Plugin startup hooks | `[[startup]]` runs after session restore and socket readiness and again after live handoff. | A plugin can restore an orchestratr-owned Agent view. |
-| Plugin registry | Installed/linked/enabled plugins are global to the user rather than per Herdr session. | Any plugin hook must explicitly scope itself to the orchestratr-owned session. |
+| Claude Code (`claude`) | built in | Claude Herdr integration installed and usable |
+| Codex CLI (`codex`) | built in | Codex Herdr integration installed and usable |
 
-### Clarifications to the combined review
+Internally, rename the current `AgentIntegration` concept to **provider adapter**. An adapter
+contains only orchestratr-owned policy:
 
-- `agent.view.set/clear` is documented. It filters/sorts the native Agents view; it does
-  **not** address alternate-screen output.
-- `worktree.*` and `agent.explain` existed before protocol 17. They remain valuable
-  underused capabilities, but should not be described as wholly new in 0.7.5.
-- The `agent.start` socket method has been verified to match the new CLI topology rule:
-  it requires a pre-existing pane. The earlier question about separate CLI/socket behavior
-  is resolved.
-- The current low-level delivery path does not call the removed protocol-16 `agent.send`,
-  so that removal alone is not a runtime break. The `agent.start` shape and strict name
-  grammar are the actual immediate breaks.
-- The installed local version is now Herdr 0.7.5 / protocol 17.
+- accepted model/effort values and their provider-native arguments;
+- any provider-specific permission arguments;
+- native transcript location and parsing;
+- small provider-specific defaults that cannot be supplied by Herdr.
+
+It is compiled code, not something users install or manage. Documentation and errors must
+never describe it as a second integration layer.
+
+### 1.3 A provider is either enabled or unavailable
+
+A provider is enabled for `orcr agent run` only when:
+
+1. it exists in orchestratr's built-in supported-provider catalog; and
+2. its Herdr integration is installed and usable.
+
+Every `agent run` performs this preflight using fresh Herdr integration status **before**
+creating a durable row, allocating queue capacity, or creating a pane.
+
+- Unknown provider: `invalid_request`, `reason: unsupported_provider`, with
+  `supported_providers: ["claude", "codex"]`.
+- Supported provider whose Herdr integration is unavailable: `integration_missing`, with
+  `provider`, `layer: "herdr"`, observed Herdr status, and the exact Herdr remediation.
+- No error ever reports a missing “orcr integration.”
+
+`server status` exposes a `providers` map rather than a two-layer `integrations` matrix:
+
+```json
+{
+  "providers": {
+    "claude": {"supported": true, "enabled": true, "herdr_integration": "current"},
+    "codex": {"supported": true, "enabled": false, "herdr_integration": "not_installed"}
+  }
+}
+```
+
+Unmanaged discovery follows the same gate. It records only Claude/Codex agents whose Herdr
+integration is usable. There is no drive-only, transcript-less, or half-supported tier.
+
+### 1.4 Why the Herdr integration remains required
+
+Herdr 0.7.5 can detect Claude/Codex lifecycle state from bundled screen manifests even when a
+session-role integration is absent. Orchestratr still requires the Herdr integration because
+full support also needs the native `agent_session` identity used by transcript lookup,
+`logs --last-response`, completion freshness, and `gc immediate`.
+
+The requirement is therefore a product capability gate, not a claim that the integration is
+the sole source of working/idle detection.
 
 ---
 
-## 3. P0 — must-have migration
+## 2. Herdr 0.7.5 facts that shape the redesign
 
-### P0.1 Pin and model protocol 17 explicitly
+| Herdr capability | Contract used by orchestratr | Design consequence |
+| --- | --- | --- |
+| Protocol 17 | Exact typed socket contract | Delete protocol-16 request types and tests. |
+| `agent.start` | `{name, kind, pane_id, args?, timeout_ms?}`; requires an existing shell pane | Orchestratr creates the tab/pane first, then asks Herdr to launch the provider. |
+| Strict live agent names | `[a-z][a-z0-9_-]{0,31}` | Use a UUID-derived Herdr alias; keep the full orchestratr path as the tab label and metadata. |
+| `launch_pending` / `interactive_ready` | Herdr-owned launch readiness | Delete provider-screen startup probing. |
+| `agent.prompt` | Occupant-validated text plus encoded Enter, bracketed-paste aware, optional atomic wait | Delete raw `pane.send_text` + sleep + Enter and submit-screen matching. |
+| `agent.wait` | Server-owned, event-driven, occupant-pinned status wait | Replace managed-agent lifecycle polling and custom live-occupant pinning. |
+| `state_change_seq` | Monotonic lifecycle epoch | Anchor persisted turn observations without sampling every transition. |
+| `agent.send_keys` | Occupant-validated Esc/Ctrl+C/etc. | Implement safe interrupt/stop without pane-level key injection. |
+| `terminal attach <terminal_id>` | Move-stable attach target | Delete pane-locator refresh-on-move logic. |
+| Detection manifests | Herdr owns screen-state classification | Orchestratr consumes state; it does not reproduce screen rules. |
+| `agent.explain` | Manifest source/version, evidence, rule and fallback | Use Herdr evidence for diagnostics instead of transcript/screen guessing. |
+| `pane/workspace.report_metadata` | Display-only user metadata | Make Herdr's native UI orchestratr-aware without duplicating another UI model. |
+| `agent.view.set/clear` | Native Agents-view projection | Optional Herdr-native filtering/sorting; unrelated to terminal capture. |
 
-The current driver calls its constant `MIN_HERDR_PROTOCOL`, accepts any reported protocol
-greater than or equal to 16, and continues sending protocol 16 in requests. That implies
-backward-compatible request shapes, which protocol 17 disproves.
+Herdr's status waits are not durable and do not identify an orchestratr turn by themselves.
+Likewise, terminal reads cannot reliably recover alternate-screen history. Those limits define
+the small amount of orchestration machinery that must remain.
 
-Implement one of these policies:
+---
 
-1. **Recommended:** support exactly protocol 17 and require Herdr 0.7.5 or a compatible
-   patch release.
-2. If protocol 16 support must remain, introduce explicit `DriverV16` and `DriverV17`
-   adapters. Do not branch ad hoc inside the spawn pipeline.
+## 3. Target architecture
 
-Required work:
+### 3.1 Provider preflight
 
-- Replace the “minimum version” contract with an explicit supported protocol set.
-- Send the negotiated/supported protocol rather than a misleading minimum constant.
-- Preserve Herdr error codes such as `protocol_mismatch` in error details.
-- Regenerate the checked-in schema fixture and driver conformance table from 0.7.5.
-- Make `server status` report the supported and connected Herdr protocol clearly.
-
-Acceptance:
-
-- A protocol-17 server passes the complete contract test.
-- A protocol-16 or unknown protocol fails before any mutation with an actionable upgrade
-  or compatibility message.
-- Conformance checks request and result shapes, not only method names and result tags.
-
-### P0.2 Replace the spawn pipeline with topology-first launch
-
-The new pipeline must preserve the existing durable-before-side-effects invariant:
+The server performs this sequence for every run request:
 
 ```text
-validate + allocate UUID/path + write launch.json + enqueue row
-  -> promote queued row to starting
-  -> ensure the level-1 workspace exists
-  -> tab.create in that workspace
+validate provider is in built-in catalog
+  -> validate model / effort using its provider adapter
+  -> verify Herdr >= 0.7.5 and protocol 17
+  -> fetch fresh Herdr integration status for that provider
+  -> require installed + usable
+  -> only then create launch.json and the queued store row
+```
+
+The server may cache provider state for display, but a run may not rely on a stale startup
+snapshot. If the integration disappears after preflight, launch failure is recorded normally
+and its pane is cleaned up.
+
+### 3.2 Topology-first spawn
+
+Protocol 17 no longer lets `agent.start` create layout. The new spawn pipeline is:
+
+```text
+preflight
+  -> allocate UUID/path and persist launch payload + queued row
+  -> promote queued -> starting
+  -> ensure the level-1 workspace
+  -> tab.create
        label = full orchestratr path
-       cwd   = resolved agent cwd
-       env   = ORCR_* contract + launch token + scoped HERDR_AGENT hint
+       cwd   = resolved cwd
+       env   = ORCR_* + launch token + HERDR_AGENT=<provider>
        focus = false
-  -> record workspace/tab/pane/terminal IDs
+  -> persist workspace/tab/pane/terminal IDs
   -> agent.start
-       name       = UUID-derived Herdr alias
-       kind       = provider
-       pane_id    = the new tab's root pane
-       args       = provider-native arguments
+       name       = UUID-derived live alias
+       kind       = claude | codex
+       pane_id    = new tab's shell pane
+       args       = provider-adapter arguments
        timeout_ms = bounded startup timeout
-  -> observe agent.get until interactive_ready=true
-  -> capture agent_session as soon as available
-  -> deliver the first prompt
+  -> wait for interactive_ready
+  -> persist agent_session as soon as Herdr exposes it
+  -> create turn 1 and submit it with agent.prompt
 ```
 
-Workspace handling:
-
-- `workspace.create` creates a root tab and shell pane. Do not leak that bootstrap shell.
-- Under the existing serialized workspace-ensure lock, create the agent tab before closing
-  the bootstrap root pane. Closing the last pane too early would auto-remove the workspace.
-- Every agent should receive a dedicated `tab.create` so its cwd and `ORCR_*` environment
-  are pane-specific.
-
-Cancellation/failure rules:
-
-- Check `cancel_requested` before and after `tab.create`, `agent.start`, and readiness.
-- On any failed/canceled launch, close the created agent pane. Let Herdr remove its empty
-  tab/workspace automatically.
-- A late launch that becomes ready after orchestratr has canceled it must still be closed.
-- `launch_pending=false && interactive_ready=false` means startup failed or the agent
-  exited before becoming interactive.
-
-Acceptance:
-
-- Environment contract reaches both real and mock providers.
-- Concurrent agents in one workspace get distinct tabs and environments.
-- Cancel at every pipeline boundary leaves no live pane.
-- A startup timeout frees the orchestratr concurrency slot and the Herdr alias.
-- Empty workspace cleanup remains correct.
-
-### P0.3 Introduce a protocol-safe Herdr agent alias
-
-Do not sanitize or truncate the orchestratr path into the Herdr name: that creates
-collision and recovery ambiguity.
-
-Recommended derivation:
+Use one deterministic protocol-safe alias everywhere in the Herdr agent API:
 
 ```text
-herdr_agent_name = "o" + first 31 lowercase characters of the UUID's dash-free hex form
+herdr_agent_name = "o" + first 31 lowercase characters of UUID hex without dashes
 ```
 
-This is deterministic, protocol-valid, at most 32 characters, and effectively unique.
-The full user-facing path remains:
+The full orchestratr path remains the durable user identity, tab label, and metadata value.
+Never sanitize/truncate the path into a live Herdr name.
 
-- the orchestratr store identity/address;
-- the Herdr tab label;
-- an optional `orcr_path` metadata token;
-- the value shown by `orcr ls` and `orcr top`.
+Workspace creation can produce a bootstrap shell. Create the agent tab before closing that
+shell so the empty workspace is not auto-removed. All cancellation boundaries must close any
+pane created by the attempt, including a launch that becomes ready after cancellation.
 
-Required work:
+### 3.3 Prompt and turn flow
 
-- Add a single `herdr_agent_name(uuid)` helper.
-- Prefer deriving the alias instead of storing another column.
-- Use the alias for `agent.start`, `agent.get`, `agent.prompt`, `agent.wait`,
-  `agent.send_keys`, and agent-scoped diagnostics.
-- Rework reconciliation: match by recorded `terminal_id` first, then UUID-derived live
-  name and tab label. Do not rely only on the path-shaped pane label.
-
-Acceptance:
-
-- Reused orchestratr paths receive different Herdr names.
-- Two long/similar paths cannot collide.
-- Crash recovery can identify a started-but-not-recorded agent without reading pane env.
-- Human UI still displays the full orchestratr path via the tab label/metadata.
-
-### P0.4 Update the typed driver surface
-
-Add/update typed protocol support for:
-
-- `tab.create`
-- `agent.get`
-- new `agent.start`
-- `agent.prompt`
-- `agent.wait`
-- `agent.send_keys`
-- `agent.read`
-- `agent.view.set/clear`
-- `pane.report_metadata`
-- `workspace.report_metadata`
-- new `AgentInfo` fields
-
-Remove the protocol-16 `AgentStartParams` shape from the v17 driver. Retain raw pane input
-methods only for deliberate low-level control and test utilities.
-
-The contract test must validate required params, significant enums, and result fields.
-
-### P0.5 Migrate attach to stable terminal attach
-
-Keep the existing orchestratr lease lifecycle:
+All text input uses `agent.prompt`; pane-level text/key injection is removed from production
+paths.
 
 ```text
-prepare under store transaction
--> persist lease before returning a locator
--> heartbeat during attach
--> release on exit / expire after abrupt death
+persist input_seq + open turn + transcript cursor + state_change_seq baseline
+  -> agent.prompt (occupant validated, atomic submission)
+  -> record delivered_while and returned lifecycle facts
+  -> agent.wait for the pinned occupant's next relevant lifecycle result
+  -> idle/done: require transcript identity, freshness and settle, then complete the turn
+  -> blocked: persist the blocked result and return control to the caller
+  -> occupant loss/timeout: preserve the open turn and reconcile conservatively
 ```
 
-Change the generated command to:
+For an idle/blocked agent, `agent.prompt` may use its atomic wait to observe activity without
+the old subscribe-after-send race. For a prompt delivered while already working, Herdr warns
+that a wait can be satisfied by the active turn rather than the newly queued prompt. That path
+must retain the persisted input epoch and require lifecycle/transcript evidence newer than the
+delivery baseline.
 
-```text
-herdr --session <session> terminal attach <terminal_id> [--takeover]
-```
+This removes:
 
-This removes the “pane moved between prepare and attach; refresh once” branch because
-`terminal_id` survives park/unpark moves.
-
-Acceptance:
-
-- Observe and takeover both work.
-- Attach survives a pane move when a move is allowed by the test fixture.
-- GC continues to defer while the lease is fresh.
-- Unmanaged agents attach through their actual Herdr session.
-
-### P0.6 Correct the specification's integration model
-
-Rewrite §2 and §11.4 to distinguish state detection from transcript identity:
-
-- Claude/Codex lifecycle state comes from Herdr's screen manifests.
-- Their installed Herdr integrations provide native session identity/restore, which is
-  load-bearing for orchestratr's transcript identity gate.
-- Some providers have full lifecycle-hook authority when their integration is installed.
-- Other providers have useful state detection but no transcript/session role.
-
-For the first migration, the existing full-support gate may remain:
-
-> Full orchestratr support requires Herdr lifecycle visibility, an orchestratr routing
-> adapter, a native session reference, and an orchestratr transcript adapter.
-
-This preserves current `ask`, `logs`, transcript-settle, and gc-immediate guarantees while
-making the reason accurate. Update `integration_missing` details to report missing
-capabilities, not the vague `orcr|herdr` binary.
-
-### P0.7 Rebuild the test harness against 0.7.5
-
-Before P1 deletion/simplification, migrate all mock/e2e infrastructure to the new launch
-path and establish a green behavioral baseline.
-
-Required suites:
-
-- live driver conformance against protocol 17;
-- topology-first mock spawn;
-- environment contract;
-- queue/cancel/crash recovery;
-- first prompt and consecutive sends;
-- completion/logs/gc-immediate;
-- park/unpark/reap and attach;
-- unmanaged discovery in a foreign session;
-- loop/SDK/recipe/top regression suites;
-- real Codex smoke and, where the environment permits, real Claude smoke.
-
-Every test must continue using a disposable `ORCR_HOME` and disposable Herdr session.
-
----
-
-## 4. P1 — immediate simplifications and reliability work
-
-### P1.1 Replace prompt two-call delivery with `agent.prompt`
-
-Use `agent.prompt` for the initial prompt and every `orcr agent send` text prompt.
-
-Required ordering:
-
-1. Resolve/unpark the managed agent and confirm its live terminal.
-2. Persist `input_seq` and the open turn before delivery.
-3. Capture the pre-delivery `state_change_seq`.
-4. Call `agent.prompt` by the UUID-derived Herdr alias.
-5. Store the returned current agent facts.
-
-Initially call it without Herdr's blocking wait. That exactly preserves orchestratr's current
-contract: `send` confirms terminal delivery, not provider acceptance. It also avoids treating
-Herdr's status wait as a turn-completion authority.
-
-After real-provider validation, delete or retire:
-
-- the arbitrary send-text-to-Enter delay;
+- two-call text/Enter delivery and its arbitrary sleep;
+- first-prompt and fast-turn subscribe races;
 - pane-input-box prompt matching;
-- full-prompt re-delivery loops;
-- `submit_ready_ms`;
-- `submit_confirm_ms`;
-- `submit_attempts`.
+- full-prompt retransmission loops;
+- `submit_ready_ms`, `submit_confirm_ms`, and `submit_attempts`;
+- managed-agent status polling as the primary completion substrate;
+- orchestratr's custom live-occupant pinning.
 
-Keep a compatibility fallback only if evidence shows `agent.prompt` is insufficient. Do not
-automatically retry a complete prompt merely because `agent_prompt_stalled` fired: a provider
-with bad state detection may have accepted the prompt, and blind retry can duplicate work.
+It does **not** remove persisted turns. Herdr waits are status-scoped rather than turn-scoped,
+do not survive an orchestratr restart, and cannot implement aggregate snapshot membership.
 
-Acceptance:
+### 3.4 Completion and waiting
 
-- Multiline text and text containing shell-like operators submit exactly once.
-- No prompt is delivered to a replacement shell or different agent.
-- Prompting idle, blocked, parked, and working agents preserves current semantics.
-- The real-provider submit-confirm flake no longer requires pane-screen heuristics.
-
-### P1.2 Use `state_change_seq` as the turn activity epoch
-
-Add `herdr_state_seq_at_delivery` to each turn or an equivalent persisted field.
-
-Candidate completion rule:
+Herdr is the authority for current live state. Orchestratr adds only durable turn meaning:
 
 ```text
-state_change_seq advanced beyond delivery baseline
-AND current Herdr state is idle/done
-AND idle is stable
-AND transcript is settled/fresh
+prompt was durably recorded before delivery
+AND post-delivery lifecycle evidence exists (state_change_seq / atomic prompt wait)
+AND the same occupant reaches idle or done
+AND its native transcript advanced beyond the saved cursor and settled
+= orchestratr turn complete
 ```
 
-This allows orchestratr to recognize a fast `working -> done` sequence even if its polling
-thread did not sample the intermediate working state.
+`orcr agent wait` still owns multi-target membership, simultaneous settle, restart recovery,
+timeouts, dead-target outcomes, and blocked aggregation. Its per-agent live waiter should use
+`agent.wait`; periodic `agent.list` remains only for reconciliation, unmanaged discovery, and
+repair after lost connections.
 
-If experiments confirm that `state_change_seq` advances only for relevant occupant lifecycle
-changes, simplify/remove:
+External input still creates a synthetic turn when Herdr reports lifecycle activity without a
+pending orchestratr turn. Transcript cursors and `state_change_seq` replace timing guesses where
+possible. Keep a conservative fallback only for cases proven impossible to express with those
+epochs.
 
-- `fast_turn_grace_ms`;
-- stale-idle timing inference;
-- stale-blocked timing inference;
-- reliance on observing every transient working state.
+### 3.5 Attach, interrupt and shutdown
 
-Do not remove the turns table, input epochs, transcript-settle gate, restart persistence, or
-multi-target wait logic.
+- Attach with `herdr --session <session> terminal attach <terminal_id> [--takeover]`.
+- Keep orchestratr's attach lease because it protects GC, but remove pane-move locator refresh.
+- Use `agent.send_keys` for interrupt/stop sequences so keys cannot hit a replacement shell.
+- Close the terminal/pane through Herdr only after graceful stop or timeout.
+- Raw `pane.send_keys` is test/diagnostic-only.
 
-Required edge-case tests:
+### 3.6 Reconciliation and identity
 
-- a turn faster than one orchestratr monitor tick;
-- two consecutive sends;
-- send while already working;
-- blocked then send;
-- focus changing Herdr `done` to `idle` without a new turn;
-- external input;
-- server restart between delivery and completion;
-- occupant replacement.
+Reconciliation matches managed agents in this order:
 
-### P1.3 Inject `HERDR_AGENT` for wrapped managed providers
+1. persisted `terminal_id`;
+2. UUID-derived Herdr live alias;
+3. full-path tab label and orchestratr metadata as diagnostic corroboration.
 
-Set `HERDR_AGENT=<provider>` only in the dedicated tab/pane environment for known Herdr agent
-kinds. Never export it globally from the orchestratr server.
-
-This should be tested first against the Avocado/MetaCode-wrapped Claude environment that
-currently fails to report working state reliably.
-
-Acceptance:
-
-- Herdr detects wrapped Claude as Claude and reports manifest-based lifecycle state.
-- Normal stock Claude/Codex behavior is unchanged.
-- Plain loop commands and non-agent panes never inherit a misleading agent hint.
-
-### P1.4 Add `orcr doctor` / `agent inspect` diagnostics
-
-Expose a consolidated diagnostic payload containing:
-
-- orchestratr row/status/turn state;
-- Herdr name, terminal, current pane, `launch_pending`, `interactive_ready`, and
-  `state_change_seq`;
-- `agent_session` presence and transcript-locator result;
-- `agent.explain` manifest source/version, matched rule/evidence, fallback reason, and
-  screen-detection authority;
-- next recommended command.
-
-Automatically attach a condensed form to startup stalls, completion timeouts, unknown state,
-and unexpected blocked state. `server status` should summarize active manifest versions or at
-least advertise the exact `agent explain` command.
-
-### P1.5 Add safe interrupt and stop controls
-
-Implement the existing §17 steer/stop item on top of `agent.send_keys`:
-
-```text
-orcr agent interrupt <path|uuid>       # provider-recommended Esc sequence
-orcr agent stop-turn <path|uuid>       # provider-recommended Ctrl+C/stop sequence
-orcr agent keys <path|uuid> <keys...>  # optional expert escape hatch
-```
-
-Keep provider recipes for the exact key sequence where necessary, but use the agent-scoped
-method so keys cannot land in a replacement shell.
+The alias makes a started-but-not-yet-recorded launch recoverable without reading pane env.
+Occupant identity and replacement detection come from Herdr, not reconstructed pane snapshots.
 
 ---
 
-## 5. P2 — good-to-have enhancements
+## 4. What can be deleted or substantially reduced
 
-### P2.1 Report orchestratr metadata into Herdr
+| Current orchestratr machinery | Replacement | Outcome |
+| --- | --- | --- |
+| Protocol-16 types and “minimum protocol 16” negotiation | Exact protocol-17 driver | Delete entirely. |
+| Old `agent.start` request that also creates topology | `tab.create` then protocol-17 `agent.start` | Replace entirely. |
+| Full path as Herdr agent name | UUID-derived alias + path label/metadata | Replace entirely. |
+| Provider startup screen probing | `launch_pending` / `interactive_ready` | Delete where Herdr exposes readiness. |
+| `pane.send_text`, sleep, Enter, submit confirmation and retries | `agent.prompt` | Delete production path and tuning knobs. |
+| Snapshot-then-subscribe live-state race handling | atomic prompt wait + `state_change_seq` + `agent.wait` | Remove most timing heuristics. |
+| Custom occupant pinning around waits/keys | agent-scoped Herdr methods | Delete. |
+| Pane-locator refresh before attach | terminal-id attach | Delete. |
+| Transcript/screen heuristics for Herdr state classification | Herdr manifests and `agent.explain` | Delete state-detection duplication. |
+| Two-layer `IntegrationState` (`orcr` + `herdr`) | built-in provider catalog + Herdr prerequisite status | Simplify and rename. |
+| Runtime-looking `AgentIntegration` terminology | internal `ProviderAdapter` | Rename; no user management surface. |
+| 200ms full fleet poll for managed completion | occupant-pinned `agent.wait` tasks | Reduce to periodic reconciliation polls. |
+| Per-provider graceful pane key injection | `agent.send_keys` + common close flow | Reduce to small key-policy mapping. |
 
-Use `pane.report_metadata` and `workspace.report_metadata` as display-only enrichment.
+Do not delete UUID/path identity, the store, queue/caps, turn records, transcript adapters,
+aggregate waits, GC policy, reconciliation, loops, the socket API, SDK, or `orcr top`. Herdr
+does not provide their durable orchestration semantics.
 
-Suggested pane tokens:
+---
 
-```text
-orcr_path
-orcr_uuid
-orcr_status
-orcr_model
-orcr_effort
-orcr_parent
-orcr_loop
-orcr_gc
-```
+## 5. P0 — required migration
 
-Suggested workspace tokens:
+### P0.1 Enforce the new runtime floor
 
-```text
-orcr_scope
-orcr_agent_count
-orcr_blocked_count
-orcr_loop_status
-```
+- Define `MIN_HERDR_VERSION = 0.7.5` and `SUPPORTED_HERDR_PROTOCOL = 17`.
+- Reject older versions and every non-17 protocol before mutation.
+- Remove protocol-16 fixtures, request types, branches, and tests.
+- Regenerate the checked-in schema/contract fixture from Herdr 0.7.5.
+- Report binary version, connected protocol, required minimum, and supported protocol in
+  `server status`.
 
-Refresh tokens on relevant orchestratr state changes and clear them before intentionally
-releasing a pane. Metadata must never become an identity or correctness authority.
+Acceptance: 0.7.4/protocol 16 fails cleanly; 0.7.5/protocol 17 passes full conformance; a
+future unsupported protocol fails closed with an actionable version-skew error.
 
-### P2.2 Provide native Herdr Agent views
+### P0.2 Replace the integration model
 
-Add an opt-in command such as:
+- Rename the internal trait/module vocabulary from integration to provider adapter.
+- Hard-code the initial provider catalog to Claude and Codex.
+- Remove the `orcr: true/false` integration layer from state and API output.
+- Perform a fresh Herdr integration check on every `agent run` before persistence.
+- Update discovery to apply the same enabled-provider predicate.
+- Make all unsupported/missing errors name only the real condition and remediation.
+- Confirm there are no `orcr integration add/install/remove` commands or docs.
 
-```text
-orcr herdr-view apply [--attention-first]
-orcr herdr-view clear
-```
+Acceptance: Claude/Codex with a usable Herdr integration can run; missing integration creates
+no row or pane; Pi/OpenCode fail as unsupported even if Herdr can detect them; no output implies
+that an orchestratr integration can be installed separately.
 
-Use `agent.view.set` to sort by attention and recent `state_change_seq`, optionally filtering
-on orchestratr metadata tokens. Views are transient and replace the previous active projection,
-so use a stable `source` and only clear a view owned by that source.
+### P0.3 Implement the protocol-17 driver
 
-This complements rather than replaces `orcr top`: Herdr views do not include queued agents,
-durable history, loop definitions/runs, orchestratr GC clocks, or the full path/lineage tree.
+Required typed methods and fields:
 
-### P2.3 Package a thin Herdr plugin
+- `tab.create` and the current topology result shapes;
+- new `agent.start` and `agent.get`;
+- `agent.prompt`, `agent.wait`, and `agent.send_keys`;
+- `agent.read` for explicit diagnostics only;
+- `launch_pending`, `interactive_ready`, `state_change_seq`, `agent_session`, custom status,
+  metadata, and stable terminal fields;
+- `pane.report_metadata`, `workspace.report_metadata`, and `agent.view.set/clear` for later
+  phases.
 
-Move the existing §17 plugin idea forward after metadata/views are stable:
+Conformance must validate parameters, important enums, result fields, and errors rather than
+only method names.
 
-- a plugin pane for `orcr top`;
-- actions for attach, last response, interrupt, and “show in orchestratr”;
-- a `[[startup]]` hook that reapplies an orchestratr-owned Agent view.
+### P0.4 Replace spawn and identity
 
-Because plugin registration is user-global in 0.7.5, every startup/action entrypoint must check
-the active Herdr session and no-op outside the configured orchestratr-owned session. It must
-never mutate the user's default session merely because the plugin is enabled globally.
+- Implement topology-first launch and UUID-derived Herdr aliases.
+- Persist each created topology identifier immediately.
+- Use Herdr readiness rather than provider startup screen recipes.
+- Inject `HERDR_AGENT=<provider>` only into the dedicated agent pane to support wrapped CLIs.
+- Close every partially created pane on failure/cancellation.
+- Update crash recovery and orphan handling for terminal ID + live alias.
 
-### P2.4 Define provider capability tiers
+Acceptance: concurrent same-workspace launches receive distinct tabs/env; cancellation at every
+boundary leaks no pane; wrapped Claude is identified; path reuse never reuses a Herdr alias.
 
-Replace the binary supported/unsupported model with explicit capabilities:
+### P0.5 Replace prompt, wait and attach mechanics
 
-| capability | supplied by |
+- Route first prompts and later sends through `agent.prompt`.
+- Persist delivery epochs before calling Herdr.
+- Use atomic prompt wait where valid and `agent.wait` for live lifecycle observation.
+- Use `state_change_seq` to survive fast transitions.
+- Move attach to `terminal attach <terminal_id>`.
+- Use `agent.send_keys` for graceful interrupt/stop.
+- Delete the superseded raw-pane production code only after the behavior matrix passes.
+
+Acceptance: multiline/shell-like text submits exactly once; no prompt or key reaches a
+replacement occupant; fast turns are observed; send-while-working cannot complete on the old
+turn; attach survives park/unpark moves.
+
+### P0.6 Rebuild tests and update the complete spec
+
+Required automated coverage:
+
+- version/protocol rejection before mutation;
+- provider preflight and fresh Herdr integration status;
+- protocol-17 live conformance;
+- topology-first spawn, environment, cancellation and crash recovery;
+- first prompt, multiline prompt, consecutive sends and send while working;
+- fast turn, blocked turn, external input and restart mid-turn;
+- transcript freshness, `ask`, `logs`, and `gc immediate`;
+- attach/park/unpark/reap and safe keys;
+- unmanaged discovery filtering;
+- loop, SDK, recipe and `top` regressions;
+- repeated real Codex and stock/wrapped Claude smoke tests.
+
+All live tests continue to use a disposable `ORCR_HOME` and Herdr session.
+
+Update `spec/spec.md`, milestone plans/notes, driver reference, `spec/codebase.md`, issues and
+todos so no normative document describes protocol 16, raw two-call prompts, path-shaped Herdr
+agent names, or a two-layer orchestratr/Herdr integration model.
+
+---
+
+## 6. P1 — immediate product improvements
+
+### P1.1 Diagnostics from `agent.explain`
+
+Add `orcr agent inspect` or `orcr doctor` showing:
+
+- orchestratr row, turn, transcript cursor and completion evidence;
+- Herdr alias, terminal/pane, readiness, state and `state_change_seq`;
+- Herdr integration status and `agent_session` presence;
+- manifest source/version, matched rule, evidence and fallback from `agent.explain`;
+- the next recommended action.
+
+Include a condensed version in startup stalls, unknown state, unexpected blocked state, and
+completion timeout errors.
+
+### P1.2 Native Herdr metadata
+
+Report display-only tokens such as `orcr_path`, UUID, model, effort, parent, loop, GC mode and
+orchestratr status through pane/workspace metadata. Use a Herdr Agent view to sort attention
+states first. Metadata is never an identity or correctness authority.
+
+### P1.3 Public interrupt and stop commands
+
+Expose `orcr agent interrupt` and `orcr agent stop-turn` on `agent.send_keys`. Keep the public
+surface semantic; do not expose arbitrary keys unless an expert command is justified later.
+
+---
+
+## 7. P2 — good-to-have follow-ups
+
+### P2.1 Worktree-per-agent
+
+Design `orcr agent run --worktree ...` using Herdr's worktree operations. Define branch naming,
+ownership, cleanup, merge/conflict handoff, and crash recovery before tying worktree deletion to
+pane GC.
+
+### P2.2 Additional providers
+
+Add a provider only by shipping a new orchestratr provider adapter and requiring its usable
+Herdr integration. Do not introduce generic drive-only providers. Candidates should be ordered
+by reliable session identity and transcript support, not merely process detection.
+
+### P2.3 Thin Herdr plugin
+
+After metadata and views stabilize, optionally package actions for `orcr top`, attach, last
+response, interrupt, and “show in orchestratr.” Herdr plugin registration is user-global, so
+all hooks must no-op outside the configured orchestratr session.
+
+### P2.4 Manifest drift operations
+
+Surface detection manifest source/version in diagnostics and document Herdr's update/reload
+commands and local override precedence. Orchestratr must not silently install detection
+overrides.
+
+---
+
+## 8. Ordered implementation sequence
+
+### Phase A — hard cut and provider gate
+
+1. Require Herdr >=0.7.5 and protocol 17; delete protocol 16.
+2. Replace two-layer integration vocabulary/state with the built-in provider catalog.
+3. Add per-run Herdr integration preflight for Claude/Codex.
+4. Regenerate and strengthen driver conformance.
+
+Exit gate: unsupported runtimes/providers/integrations fail before mutation.
+
+### Phase B — protocol-17 spawn
+
+1. Add topology and protocol-17 agent types.
+2. Add UUID-derived aliases.
+3. Implement topology-first spawn and Herdr-owned readiness.
+4. Update cancellation, cleanup, reconciliation and mock launch.
+
+Exit gate: Claude/Codex panes start reliably with no leak in the full failure matrix.
+
+### Phase C — remove custom terminal mechanics
+
+1. Add `agent.prompt`, `agent.wait`, `state_change_seq` and `agent.send_keys`.
+2. Migrate first prompt, send, lifecycle observation and graceful stop.
+3. Move attach to stable terminal ID.
+4. Prove the turn edge-case matrix.
+5. Delete raw prompt delivery, submit-confirm tuning, custom occupant pinning and primary managed
+   status polling.
+
+Exit gate: repeated real-provider tests show no duplicate/dropped prompt or stale-turn completion.
+
+### Phase D — diagnostics and native UI
+
+1. Add `agent.explain`-backed inspection.
+2. Report metadata and add the orchestratr Agent view.
+3. Expose interrupt/stop commands.
+
+### Phase E — optional expansion
+
+1. Design worktree ownership.
+2. Add providers one fully supported adapter at a time.
+3. Consider a session-scoped Herdr plugin.
+
+---
+
+## 9. Primary touchpoints
+
+| Area | Likely files/sections |
 | --- | --- |
-| `control` | Herdr recognizes the agent kind and can start/prompt/send keys. |
-| `lifecycle` | Herdr manifest or authoritative lifecycle integration. |
-| `routing` | Orchestratr knows normalized model/effort/permission arguments. |
-| `session_identity` | Herdr reports a native session pointer. |
-| `transcript` | Orchestratr can locate and parse that native transcript. |
-| `structured_response` | A reliable settled final response is available. |
-
-Recommended tiers:
-
-- **Full:** current `run/send/wait/logs/ask/gc` guarantees.
-- **Controlled:** path/queue/run/send/interrupt/kill/attach/top, but no transcript-backed
-  `logs --last-response` or `ask`; guaranteed outputs use the file convention.
-- **Detected unmanaged:** discovery/visibility only until the user explicitly adopts it.
-
-Do not silently downgrade. Return capability-specific errors and publish the capability map in
-`server status` and the socket schema.
-
-### P2.5 Add generic provider-native arguments
-
-Herdr 0.7.5 knows many more agent kinds than orchestratr has routing adapters. For controlled
-tier providers, consider:
-
-```text
-orcr agent run -a pi --name worker -- <native args...>
-```
-
-Normalized `--model`, `--effort`, and permission profiles remain available only where an
-orchestratr routing adapter declares them.
-
-Likely full-support candidates should be prioritized by session identity and transcript
-availability rather than only by Herdr process detection.
-
-### P2.6 Pull worktree-per-agent workflows forward
-
-Herdr's existing `worktree.list/create/open/remove` surface can support the §17 worktree item.
-This is not a 0.7.5-only addition, but the new agent launch flow makes an explicit worktree
-placement option timely:
-
-```text
-orcr agent run ... --worktree <new|existing>
-```
-
-Design requirements before implementation:
-
-- ownership and deletion policy;
-- branch naming and collision handling;
-- whether cleanup follows pane GC or agent-history/data retention;
-- merge/conflict handoff;
-- crash recovery when a worktree exists but the pane/store transition did not finish.
-
-### P2.7 Treat detection-manifest drift as an operational dependency
-
-Add manifest source/version to diagnostic output and document:
-
-- remotely updated manifest behavior;
-- local override precedence;
-- `herdr server update-agent-manifests`;
-- `herdr server reload-agent-manifests`;
-- how to capture `agent explain --json` for a bug report.
-
-Do not automatically install local overrides from orchestratr. Recommend or generate one only
-through an explicit user action.
-
----
-
-## 6. P3 — exploratory work
-
-### P3.1 Use `agent.wait` as an internal live-status substrate
-
-Investigate replacing the 200ms full-session `agent.list` polling loop with Herdr event-driven
-waits/subscriptions.
-
-Potential benefit:
-
-- lower polling overhead;
-- occupant pinning supplied by Herdr;
-- prompt and status observation can share one server-side sequence.
-
-Constraints:
-
-- one blocking wait/socket per active agent may cost more than one fleet poll;
-- waits are not durable across orchestratr restart;
-- waits are not turn-scoped;
-- an already-working prompt can settle on the active turn;
-- external input and aggregate simultaneous waits still need orchestratr state.
-
-Proceed only after a prototype compares complexity and scale against the current monitor.
-
-### P3.2 Add an explicit terminal-screen diagnostic read
-
-An opt-in command may expose `agent.read`:
-
-```text
-orcr agent inspect <target> --screen visible|recent|detection
-```
-
-Never make this an automatic substitute for native transcript logs or last-response. Full-screen
-agents can use the alternate screen; once rows disappear from the visible buffer Herdr cannot
-recover them. The result must be labeled as a terminal snapshot, potentially truncated and not a
-structured assistant response.
-
----
-
-## 7. What must remain orchestratr-owned
-
-The following machinery is not made redundant by Herdr 0.7.5:
-
-- UUID/path identity, history, glob selection, scope, and lineage.
-- Durable queue, global/per-provider caps, FIFO promotion, and cancellation barriers.
-- Persisted input epochs and turn records across process restarts.
-- Transcript adapters, identity/freshness gates, structured logs, and final responses.
-- Multi-target snapshot membership and simultaneous-settle `orcr agent wait` semantics.
-- Pane-lifetime GC policies, crash-safe move transactions, reaping, and attach leases.
-- Store/Herdr reconciliation and unmanaged discovery.
-- Durable loop scheduler, process groups, restart recovery, and run logs.
-- Orchestratr socket API, TypeScript SDK, recipes, skill, and `orcr top`.
-
-The correct simplification is to remove duplicated terminal mechanics, not orchestratr's durable
-control-plane semantics.
-
----
-
-## 8. Ordered implementation phases
-
-### Phase A — protocol and spawn compatibility (P0)
-
-1. Update the live schema fixture and exact protocol policy.
-2. Add v17 protocol types and contract checks.
-3. Add `tab.create`, new `agent.start`, and new AgentInfo fields.
-4. Implement UUID-derived Herdr aliases.
-5. Replace spawn with topology-first launch/readiness.
-6. Update reconciliation and all spawn/cancel/crash tests.
-7. Migrate attach to `terminal attach`.
-8. Correct §2, §5.2, §11.1, §11.4, §11.7, §13, and milestone notes.
-
-Exit gate: all existing behavior passes against live Herdr 0.7.5 and the mock provider.
-
-### Phase B — atomic input and lifecycle epochs (P1)
-
-1. Add `agent.prompt`, `agent.send_keys`, and `agent.get` driver methods.
-2. Route initial prompts and sends through `agent.prompt`.
-3. Validate real-provider delivery before deleting the old confirm path.
-4. Persist and test `state_change_seq` baselines.
-5. Simplify fast-turn/stale-state timing only after the edge-case matrix passes.
-6. Add the scoped `HERDR_AGENT` hint.
-
-Exit gate: mock suites plus repeated real Codex/Claude smoke show no duplicate/dropped prompts,
-no stale-turn completion, and no new lifecycle regression.
-
-### Phase C — diagnostics and control (P1)
-
-1. Add `agent inspect` / `orcr doctor` using `agent.explain`.
-2. Include manifest/session/turn evidence in failure details.
-3. Add interrupt/stop-turn commands using `agent.send_keys`.
-
-### Phase D — native UI integration (P2)
-
-1. Report pane/workspace metadata.
-2. Add opt-in `agent.view` management.
-3. Package a session-scoped Herdr plugin after the CLI contract is stable.
-
-### Phase E — capability expansion (P2/P3)
-
-1. Publish provider capability tiers.
-2. Add controlled-tier generic providers and native args.
-3. Add full providers according to transcript/session availability.
-4. Design worktree-per-agent ownership and recovery.
-5. Benchmark event-driven Herdr waits against the current poller.
-
----
-
-## 9. Primary code and spec touchpoints
-
-| area | likely files/sections |
-| --- | --- |
-| Protocol and driver | `src/driver/protocol.rs`, `src/driver/mod.rs`, `src/driver/contract.rs`, conformance fixture/tests |
-| Spawn, prompt, attach, reconciliation | `src/server/engine.rs`, `src/server/gc.rs` |
-| Turn activity/completion | `src/server/completion.rs`, `src/store/schema.rs`, `src/store/mod.rs` |
-| Provider capabilities/routing | `src/driver/integration.rs`, provider modules, `src/config.rs` |
-| CLI/API | `src/cli.rs`, `src/api.rs` |
-| Native UI/plugin | driver metadata/view methods, future plugin manifest/scripts |
-| Main design | `spec/spec.md` §2, §4, §5.2, §5.6, §6.1, §7, §10, §11.1, §11.4, §11.7, §13, §14, §15, §17 |
-| Implementation records | `spec/_impl/herdr-driver-reference.md`, milestone plans/notes, `spec/codebase.md`, `spec/issues.md`, `spec/todos.md` |
+| Version and protocol | `src/driver/protocol.rs`, `src/driver/mod.rs`, `src/driver/contract.rs`, handshake/conformance tests |
+| Provider catalog/preflight | current `src/driver/integration.rs` and provider modules, `src/server/engine.rs`, `src/server/discovery.rs` |
+| Spawn/prompt/attach | `src/server/engine.rs`, driver method wrappers, CLI attach path |
+| Turn completion | `src/server/completion.rs`, turn/store schema and tests |
+| Status/API/errors | `src/server/mod.rs`, `src/cli.rs`, `src/error.rs`, socket schema |
+| Main design | `spec/spec.md` sections 2, 4, 5.6, 5.7, 6.1, 11.1, 11.4, 11.5, 11.7, 13, 15–17 |
+| Implementation records | driver reference, milestone plans/notes, `spec/codebase.md`, issues and todos |
 
 ---
 
@@ -668,5 +508,3 @@ no stale-turn completion, and no new lifecycle regression.
 - CLI reference: <https://herdr.dev/docs/cli-reference/>
 - Socket API and Agent views: <https://herdr.dev/docs/socket-api/>
 - Plugins and startup hooks: <https://herdr.dev/docs/plugins/>
-- Local source of truth before migration: `spec/spec.md`,
-  `spec/_impl/herdr-driver-reference.md`, and `spec/codebase.md`.

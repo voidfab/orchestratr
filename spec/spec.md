@@ -41,8 +41,8 @@ lifecycle, scheduling, and a uniform cross-provider contract.
 ### Goals
 
 - Agents as real TUIs: plan-pricing-safe, attachable, steerable, visible.
-- One interface across agent providers, via per-provider **integrations** (claude and
-  codex ship first; the integration surface is designed for more).
+- One interface across agent providers, via **built-in provider support** (Claude and
+  Codex ship first; adding another provider requires a new orcr release).
 - Extreme-minimal primitives that compose from any language. **The server's socket API
   is the API** (mirroring herdr's own design); the CLI and the SDK are thin clients of
   it.
@@ -165,15 +165,16 @@ you / a script / another agent
   session's herdr server headless, `orcr agent attach` (which execs
   `herdr agent attach` in the user's terminal), and — since sockets are per-session —
   enumerating sessions via `herdr session list --json`.
-- **Integrations** — one orcr module per agent provider (named after herdr's own
-  integrations): launch argv (bypass flags, model/effort mapping), startup recipe,
+- **Built-in provider support** — one compiled orcr module per agent provider: launch
+  argv (bypass flags, model/effort mapping), startup recipe,
   completion-detection parameters, graceful-shutdown recipe, transcript adapter.
   **claude and codex ship built-in** behind a shared `AgentIntegration` trait; there is
-  no separately installed orcr integration or runtime integration manager. Adding a
-  provider means implementing the trait in its own module and shipping a new orcr release.
-  A provider is **supported only when both layers are present** — orcr's integration
-  *and* herdr's integration for that provider (`herdr integration install <p>`);
-  anything else fails fast at `agent run` with the exact install commands, and
+  no separately installable orcr integration, `orcr integration` command, or runtime
+  integration manager. `AgentIntegration` is only an internal Rust trait. Adding a
+  provider means implementing it and shipping a new orcr release. A provider is
+  **enabled only when both requirements are present** — built-in orcr support and
+  Herdr's installed integration for that provider (`herdr integration install <p>`);
+  anything else fails fast at `agent run` with the exact remediation, and
   unmanaged discovery skips it. No degraded half-modes (§11.4).
 - **Store** — sqlite (WAL) under `~/.orcr/`, owned exclusively by the server. Schema
   in §12.
@@ -543,7 +544,8 @@ their own sessions — but only *manages* the ones it created.
 
 - **Managed** — created by `agent run` in the owned session. Full lifecycle.
 - **Unmanaged (detected)** — agents herdr detects in the user's own sessions,
-  **for supported providers only** (both integrations present, §11.4 — others are
+  **for enabled providers only** (built-in support plus the Herdr integration,
+  §11.4 — others are
   ignored entirely). The server discovers them into the store and keeps them current
   while it runs (state changes, closure — polled/streamed from herdr every few
   seconds). Identity is
@@ -574,7 +576,7 @@ their own sessions — but only *manages* the ones it created.
 | `send` | ✓ | ✓ (delivery works; the turn it starts is tracked as external) |
 | `wait` | ✓ full semantics | ✓ on herdr-reported status |
 | `attach` | ✓ | ✓ |
-| `logs` / `--last-response` | ✓ | ✓ (both integrations are guaranteed for tracked agents; `transcript_unavailable` if the transcript can't be located/settled) |
+| `logs` / `--last-response` | ✓ | ✓ (built-in transcript support and the Herdr integration are guaranteed for tracked agents; `transcript_unavailable` if the transcript can't be located/settled) |
 | `kill` | ✓ | requires `--force` (closes a pane orcr doesn't own) |
 | `ls` / `top` | ✓ | ✓ (grouped under `unmanaged/<session>`) |
 
@@ -669,7 +671,7 @@ entries); `--follow` = keep streaming after that (they compose: `--tail 50 --fol
 the `tail -n` / `tail -f` pair, same as docker/kubectl). `--last-response` prints only
 the final assistant message and **fails loudly rather than guessing**: exit 1
 `transcript_unavailable` when no final response is identifiable; exit 2
-`integration_missing` when the provider has no orcr integration (§11.4). orcr never
+`integration_missing` when the provider is not built into this orcr release (§11.4). orcr never
 copies responses anywhere — `logs` always reads the provider's native transcript
 (completion records only a transcript locator/cursor, §12); the known limitation:
 if a provider later rotates or deletes its transcript files, historical
@@ -1639,40 +1641,40 @@ the active count →
 honor `paused`/`ended` → start pending runs as slots allow → recompute
 `next_fire_at`, skipping missed fires with event rows explaining each decision.
 
-### 11.4 Integrations: both layers required
+### 11.4 Built-in provider support + Herdr integration required
 
-Two independent integration layers exist per provider:
+Two requirements exist per provider, but only one is an installable integration:
 
 - **herdr's integration** (installed via `herdr integration install <provider>`) —
   hooks the provider so herdr can *observe* it: agent state (working/idle/blocked)
   and the `agent_session` transcript pointer. herdr reports a blocked *state*
   (sometimes with a free-text message) but no structured reason.
-- **orcr's integration** (built into orcr; claude + codex first) — how orcr *drives*
-  the provider: launch argv (bypass-permissions flags, model/effort mapping), startup
-  recipe, completion tuning (§5.6 named parameters), graceful-shutdown recipe, the
-  transcript adapter, and `blocked_kind` classification (best-effort, from herdr's
-  blocked message + the transcript; detailed per-provider parsing is future work).
+- **orcr's built-in provider support** (Claude + Codex first) — compiled code that
+  knows how to drive and read the provider: launch argv (bypass-permissions flags,
+  model/effort mapping), startup recipe, completion tuning (§5.6), graceful shutdown,
+  transcript adapter, and best-effort `blocked_kind` classification. The internal Rust
+  trait is named `AgentIntegration`, but this is not a user-installable integration.
 
-**The rule: a provider is supported only when both are present.** Anything else would
+**The rule: a provider is enabled only when both requirements are present.** Anything else would
 mean a lattice of half-working modes (status stuck `unknown`, waits that can't
 resolve, GC that can't see idle, logs without transcripts) — complexity that isn't
 worth carrying. So:
 
-- `agent run -a <p>` **fails fast** with `integration_missing` when either layer is
-  absent — `details` names which layer(s) and the exact fix
-  (`herdr integration install <p>`, or "provider not built into this orcr release").
-  Nothing is spawned. There is no command to install an orcr-side integration.
-- **Unmanaged discovery only tracks supported providers.** Agents of providers
-  missing either layer are ignored (not stored, not shown); `server status` reports
-  per-provider integration state (`integrations: {claude: {orcr, herdr}, …}`) so the
-  gap is visible.
+- `agent run -a <p>` **fails fast** with `integration_missing` when either requirement
+  is absent. For Herdr, the fix is `herdr integration install <p>`. For orcr, the
+  message says the provider is not built into this release; there is no install
+  command or runtime fix. Nothing is spawned.
+- **Unmanaged discovery only tracks enabled providers.** Other agents are ignored.
+  For backward-compatible API naming, `server status` reports
+  `integrations: {claude: {orcr, herdr}, …}`; the `orcr` boolean means “provider
+  support compiled into this binary,” not “an orcr integration was installed.”
 - `server status` and `--help` list the supported provider set.
 
-| provider | orcr integration | herdr integration | supported |
+| provider | built into orcr | required Herdr integration | enabled |
 | --- | --- | --- | --- |
 | claude | built-in (first release) | `herdr integration install claude` | ✓ |
 | codex | built-in (first release) | `herdr integration install codex` | ✓ |
-| pi / opencode / … | requires a built-in module in a future release | available in herdr | not yet — `run` fails with the message above |
+| pi / opencode / … | requires a future orcr release | available in herdr | not yet — `run` fails with the message above |
 
 Each built-in module implements `AgentIntegration` and validates both model and effort
 before enqueueing. Invalid routes return `invalid_request` with `reason: invalid_model`
@@ -1682,7 +1684,7 @@ or `invalid_effort`, print the accepted values, and include `valid_models` or
 Claude exposes no headless catalog. Codex queries and briefly caches app-server
 `model/list`, then validates effort against that model's advertised effort set.
 
-**Transcript adapters** (the orcr-integration piece behind `logs`): locate and parse
+**Transcript adapters** (the built-in provider-support piece behind `logs`): locate and parse
 the provider's native session files into a common shape (ordered messages, roles, tool
 calls, token counts). **Identity is a gate, not a guess**: adapters select transcripts
 by the pane's `agent_session` id and the agent's `created_at` — never by cwd mtime
