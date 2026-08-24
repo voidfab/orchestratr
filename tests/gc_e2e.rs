@@ -287,8 +287,6 @@ impl UserSession {
                 cwd: None,
                 env,
                 focus: false,
-                split: None,
-                tab_id: None,
                 workspace_id: None,
             })
             .expect("hand-start mock");

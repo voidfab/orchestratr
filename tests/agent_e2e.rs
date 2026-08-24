@@ -669,8 +669,6 @@ fn e2e_crash_recovery_closes_orphan() {
         cwd: None,
         env: std::collections::BTreeMap::new(),
         focus: false,
-        split: None,
-        tab_id: None,
         workspace_id: Some(ws.workspace.workspace_id.clone()),
     };
     let orphan_pane = ts.driver.agent_start(&orphan).unwrap().pane_id;

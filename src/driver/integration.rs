@@ -2,7 +2,7 @@
 //! layers are present: orcr's built-in integration **and** herdr's integration.
 //!
 //! herdr's integration state is read by parsing `herdr integration status` (no dedicated
-//! socket method exists in protocol 16 — see the driver reference). orcr's built-in set
+//! socket method exists in protocol 20 — see the driver reference). orcr's built-in set
 //! (claude + codex in the first release) is known statically.
 
 use super::transcript::TranscriptFormat;

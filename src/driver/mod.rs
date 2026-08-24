@@ -165,12 +165,66 @@ impl HerdrDriver {
         })
     }
 
-    /// `agent.start` — herdr creates the tab + pane and runs the provider argv; the
-    /// returned ids are authoritative.
+    /// `tab.create` — create a tab (optionally in a given workspace); returns the created
+    /// tab + its root shell pane. This is where `cwd` and `env` are applied under herdr
+    /// protocol 20: `agent.start` no longer accepts either.
+    pub fn tab_create(
+        &self,
+        workspace_id: Option<&str>,
+        cwd: Option<&str>,
+        env: &std::collections::BTreeMap<String, String>,
+        focus: bool,
+    ) -> Result<TabCreated> {
+        let r = self.call(
+            "tab.create",
+            json!({ "workspace_id": workspace_id, "cwd": cwd, "env": env, "focus": focus }),
+        )?;
+        expect_type(&r, "tab_created")?;
+        Ok(TabCreated {
+            tab: from_field(&r, "tab")?,
+            root_pane: from_field(&r, "root_pane")?,
+        })
+    }
+
+    /// Start an agent, lowering orcr's launch intent onto the herdr protocol-20 contract.
+    ///
+    /// Under protocol 20 `agent.start` attaches a provider to an **existing idle shell pane**
+    /// and takes `{name, kind, pane_id, args}` — herdr resolves the executable from `kind`, and
+    /// the call no longer carries `cwd`/`env`/`focus`/`split`/`tab_id`/`workspace_id`. So orcr
+    /// pre-creates the tab (carrying `cwd` + `env`) and starts the agent in its root pane.
+    ///
+    /// The returned ids are still authoritative. If `agent.start` fails after the tab exists,
+    /// the fresh pane is closed so a failed launch leaks no empty tab.
     pub fn agent_start(&self, params: &AgentStartParams) -> Result<AgentInfo> {
-        let r = self.call("agent.start", serde_json::to_value(params).unwrap())?;
-        expect_type(&r, "agent_started")?;
-        from_field(&r, "agent")
+        let (kind, args) = params.split_argv()?;
+        let created = self.tab_create(
+            params.workspace_id.as_deref(),
+            params.cwd.as_deref(),
+            &params.env,
+            params.focus,
+        )?;
+        let pane_id = created.root_pane.pane_id;
+        let started = self
+            .call(
+                "agent.start",
+                json!({
+                    "name": params.name,
+                    "kind": kind,
+                    "pane_id": pane_id,
+                    "args": args,
+                }),
+            )
+            .and_then(|r| {
+                expect_type(&r, "agent_started")?;
+                from_field::<AgentInfo>(&r, "agent")
+            });
+        match started {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                let _ = self.pane_close(&pane_id);
+                Err(e)
+            }
+        }
     }
 
     /// `pane.send_text` — type text into a pane (first half of the two-call rule).
@@ -391,6 +445,13 @@ impl HerdrDriver {
 #[derive(Debug, Clone)]
 pub struct WorkspaceCreated {
     pub workspace: WorkspaceInfo,
+    pub tab: TabInfo,
+    pub root_pane: PaneInfo,
+}
+
+/// The result of `tab.create`.
+#[derive(Debug, Clone)]
+pub struct TabCreated {
     pub tab: TabInfo,
     pub root_pane: PaneInfo,
 }

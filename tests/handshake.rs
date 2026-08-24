@@ -2,7 +2,7 @@
 //! protocol number"). This runs without herdr by pointing the driver at a stub Unix
 //! socket that returns a `pong` with a bad protocol number.
 
-use orchestratr::driver::HerdrDriver;
+use orchestratr::driver::{HerdrDriver, MIN_HERDR_PROTOCOL};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::thread;
@@ -35,7 +35,7 @@ fn spawn_stub(path: std::path::PathBuf, protocol: u32) -> thread::JoinHandle<()>
 fn rejects_fabricated_low_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("stub.sock");
-    let h = spawn_stub(sock.clone(), 1); // fabricated, below the required minimum (16)
+    let h = spawn_stub(sock.clone(), 1); // fabricated, below MIN_HERDR_PROTOCOL
 
     let err = match HerdrDriver::connect(&sock) {
         Ok(_) => panic!("driver accepted a herdr reporting protocol 1"),
@@ -50,9 +50,10 @@ fn rejects_fabricated_low_protocol() {
 fn accepts_matching_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("stub_ok.sock");
-    let h = spawn_stub(sock.clone(), 16); // the required minimum
+    let h = spawn_stub(sock.clone(), MIN_HERDR_PROTOCOL); // the required minimum
 
-    let driver = HerdrDriver::connect(&sock).expect("driver should accept protocol 16");
-    assert_eq!(driver.protocol(), 16);
+    let driver =
+        HerdrDriver::connect(&sock).expect("driver should accept the minimum protocol");
+    assert_eq!(driver.protocol(), MIN_HERDR_PROTOCOL);
     h.join().unwrap();
 }

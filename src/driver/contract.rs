@@ -56,6 +56,11 @@ pub const DRIVER_CONTRACT: &[DriverOp] = &[
         result_type: "workspace_created",
     },
     DriverOp {
+        op: "tab_create",
+        method: "tab.create",
+        result_type: "tab_created",
+    },
+    DriverOp {
         op: "agent_start",
         method: "agent.start",
         result_type: "agent_started",

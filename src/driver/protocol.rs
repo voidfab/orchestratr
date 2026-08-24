@@ -1,4 +1,4 @@
-//! herdr socket wire protocol types (protocol 16), mirroring the shapes published by
+//! herdr socket wire protocol types (protocol 20), mirroring the shapes published by
 //! `herdr api schema --json`. Requests are `{protocol, id, method, params}`; success
 //! responses are `{id, result:{type:"<tag>", ...}}` (a tagged union on `type`); errors
 //! are `{id, error:{code, message}}`. Newline-delimited JSON, one request per connection.
@@ -6,7 +6,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The herdr socket protocol version orcr is built against and requires as a minimum.
-pub const MIN_HERDR_PROTOCOL: u32 = 16;
+///
+/// herdr 0.8.0 raised this to 20. The only shape orcr consumes that broke across 16 -> 20 is
+/// `agent.start` (see [`AgentStartParams`]); every other pinned method is additive-compatible.
+pub const MIN_HERDR_PROTOCOL: u32 = 20;
 
 /// Raw agent lifecycle state as reported by herdr. This is
 /// the only vocabulary herdr emits; orcr normalizes it (see [`normalize_done`]).
@@ -236,23 +239,41 @@ pub enum SplitDirection {
     Down,
 }
 
-/// Params for `agent.start`: herdr creates the tab + pane and the returned
-/// ids are authoritative — orcr does not pre-create tabs.
-#[derive(Debug, Clone, Serialize)]
+/// orcr's launch intent for a new agent. This is **not** the herdr wire shape.
+///
+/// Under herdr protocol 16 it was: herdr created the tab + pane itself and ran `argv`. Under
+/// protocol 20 (`herdr` 0.8.0) `agent.start` attaches an agent to an *existing, idle* shell
+/// pane and takes a provider `kind` + `args` — herdr owns the executable — and it no longer
+/// accepts `cwd`/`env`/`focus`/`split`/`tab_id`/`workspace_id`.
+///
+/// [`HerdrDriver::agent_start`](crate::driver::HerdrDriver::agent_start) therefore lowers this
+/// intent onto two calls: `tab.create` (which still carries `cwd` + `env`) and then
+/// `agent.start` against the new tab's root pane.
+#[derive(Debug, Clone)]
 pub struct AgentStartParams {
     pub name: String,
+    /// Full provider argv as the integration built it. `argv[0]` is the provider label
+    /// (`claude`, `codex`) and becomes herdr's `kind`; the rest become `args`.
     pub argv: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     pub focus: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub split: Option<SplitDirection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tab_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+}
+
+impl AgentStartParams {
+    /// Split `argv` into herdr's `(kind, args)`. herdr resolves the executable from `kind`
+    /// (`detect::interactive_agent_executable`), so `argv[0]` must be a label herdr knows —
+    /// which is exactly what the built-in integrations emit.
+    pub fn split_argv(&self) -> Result<(&str, &[String]), crate::error::OrcrError> {
+        let (kind, args) = self.argv.split_first().ok_or_else(|| {
+            crate::error::OrcrError::invalid_request(
+                "agent launch argv is empty; cannot derive a herdr agent kind",
+                "empty_argv",
+            )
+        })?;
+        Ok((kind.as_str(), args))
+    }
 }
 
 /// A pane-move destination (tagged union on `type`).
@@ -361,22 +382,35 @@ mod tests {
     }
 
     #[test]
-    fn agent_start_params_omit_nulls() {
+    fn agent_start_params_split_argv_yields_kind_and_args() {
         let p = AgentStartParams {
             name: "x".into(),
-            argv: vec!["claude".into()],
+            argv: vec![
+                "claude".into(),
+                "--dangerously-skip-permissions".into(),
+                "--model".into(),
+                "opus".into(),
+            ],
             cwd: None,
             env: Default::default(),
             focus: false,
-            split: None,
-            tab_id: None,
             workspace_id: Some("w1".into()),
         };
-        let v = serde_json::to_value(&p).unwrap();
-        assert_eq!(v["name"], "x");
-        assert_eq!(v["focus"], false);
-        assert_eq!(v["workspace_id"], "w1");
-        assert!(v.get("cwd").is_none());
-        assert!(v.get("tab_id").is_none());
+        let (kind, args) = p.split_argv().unwrap();
+        assert_eq!(kind, "claude");
+        assert_eq!(args, ["--dangerously-skip-permissions", "--model", "opus"]);
+    }
+
+    #[test]
+    fn agent_start_params_reject_empty_argv() {
+        let p = AgentStartParams {
+            name: "x".into(),
+            argv: vec![],
+            cwd: None,
+            env: Default::default(),
+            focus: false,
+            workspace_id: None,
+        };
+        assert!(p.split_argv().is_err());
     }
 }

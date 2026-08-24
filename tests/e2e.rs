@@ -190,8 +190,6 @@ fn e2e_agent_lifecycle_and_state_reporting() {
         cwd: None,
         env,
         focus: false,
-        split: None,
-        tab_id: None,
         workspace_id: Some(ws.clone()),
     };
     let agent = d.agent_start(&params).unwrap();
@@ -231,8 +229,6 @@ fn e2e_agent_lifecycle_and_state_reporting() {
         cwd: None,
         env: BTreeMap::new(),
         focus: false,
-        split: None,
-        tab_id: None,
         workspace_id: Some(ws.clone()),
     };
     let qpane = d.agent_start(&quiet).unwrap().pane_id;

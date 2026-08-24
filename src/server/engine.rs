@@ -247,7 +247,8 @@ impl Server {
         let (workspace_id, root_pane) =
             self.ensure_workspace(&driver, &path::home_workspace(&agent.path))?;
 
-        // agent.start — herdr creates the tab + pane; returned ids are authoritative.
+        // agent.start — the driver creates the tab (carrying cwd + env) and attaches the
+        // provider to its root pane; returned ids are authoritative.
         self.bail_if_cancelled(uuid, None)?;
         let params = AgentStartParams {
             name: path::herdr_name(&agent.path),
@@ -255,8 +256,6 @@ impl Server {
             cwd: payload.cwd.clone(),
             env: payload.env.clone(),
             focus: false,
-            split: None,
-            tab_id: None,
             workspace_id: Some(workspace_id),
         };
         let info = match driver.agent_start(&params) {
