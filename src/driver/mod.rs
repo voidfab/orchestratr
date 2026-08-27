@@ -195,6 +195,15 @@ impl HerdrDriver {
     ///
     /// The returned ids are still authoritative. If `agent.start` fails after the tab exists,
     /// the fresh pane is closed so a failed launch leaks no empty tab.
+    ///
+    /// Two protocol-20 details are absorbed here rather than pushed onto callers:
+    ///
+    /// - The wire `name` is [`AgentStartParams::herdr_agent_name`], not `params.name`. herdr
+    ///   validates the agent name as `^[a-z][a-z0-9_-]{0,31}$`, which no orcr path satisfies.
+    /// - herdr 0.7.2's `agent.start` set both the agent name *and* the pane's manual label;
+    ///   0.8.0 sets only the agent name. orcr matches orphan panes by label during crash
+    ///   recovery, so the label is restored explicitly with `pane.rename`, still carrying the
+    ///   full unmangled path. Best-effort: a live agent is not worth failing over a label.
     pub fn agent_start(&self, params: &AgentStartParams) -> Result<AgentInfo> {
         let (kind, args) = params.split_argv()?;
         let created = self.tab_create(
@@ -208,7 +217,7 @@ impl HerdrDriver {
             .call(
                 "agent.start",
                 json!({
-                    "name": params.name,
+                    "name": params.herdr_agent_name(),
                     "kind": kind,
                     "pane_id": pane_id,
                     "args": args,
@@ -219,12 +228,26 @@ impl HerdrDriver {
                 from_field::<AgentInfo>(&r, "agent")
             });
         match started {
-            Ok(info) => Ok(info),
+            Ok(info) => {
+                let _ = self.pane_rename(&info.pane_id, &params.name);
+                Ok(info)
+            }
             Err(e) => {
                 let _ = self.pane_close(&pane_id);
                 Err(e)
             }
         }
+    }
+
+    /// `pane.rename` — set a pane's manual label. Free-form (herdr only trims it), so this
+    /// carries orcr's full path, unlike the agent `name`.
+    pub fn pane_rename(&self, pane_id: &str, label: &str) -> Result<()> {
+        let r = self.call(
+            "pane.rename",
+            json!({ "pane_id": pane_id, "label": label }),
+        )?;
+        expect_type(&r, "pane_info")?;
+        Ok(())
     }
 
     /// `pane.send_text` — type text into a pane (first half of the two-call rule).

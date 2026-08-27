@@ -86,6 +86,11 @@ pub const DRIVER_CONTRACT: &[DriverOp] = &[
         result_type: "pane_move",
     },
     DriverOp {
+        op: "pane_rename",
+        method: "pane.rename",
+        result_type: "pane_info",
+    },
+    DriverOp {
         op: "pane_close",
         method: "pane.close",
         result_type: "ok",

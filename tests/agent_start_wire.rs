@@ -6,7 +6,9 @@
 //! every spawn died on the socket with `missing field 'kind'`. These tests run without herdr
 //! and assert the bytes orcr actually puts on the wire.
 
-use orchestratr::driver::{AgentStartParams, HerdrDriver, MIN_HERDR_PROTOCOL};
+use orchestratr::driver::{
+    is_valid_herdr_agent_name, AgentStartParams, HerdrDriver, MIN_HERDR_PROTOCOL,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
@@ -64,6 +66,14 @@ fn spawn_stub(
                         "focused": false, "revision": 2
                     }
                 }),
+                "pane.rename" => serde_json::json!({
+                    "type": "pane_info",
+                    "pane": {
+                        "pane_id": "w1:p7", "terminal_id": "term-7", "workspace_id": "w1",
+                        "tab_id": "w1:t2", "focused": false, "agent_status": "unknown",
+                        "revision": 3
+                    }
+                }),
                 _ => serde_json::json!({ "type": "ok" }),
             };
             let mut out =
@@ -71,7 +81,7 @@ fn spawn_stub(
             out.push(b'\n');
             let _ = stream.write_all(&out);
             let _ = stream.flush();
-            let done = method == "agent.start";
+            let done = method == "pane.rename";
             let _ = tx.send((method, params));
             if done {
                 break;
@@ -82,8 +92,12 @@ fn spawn_stub(
 }
 
 fn params() -> AgentStartParams {
+    params_named("horos/r1/iteration")
+}
+
+fn params_named(name: &str) -> AgentStartParams {
     AgentStartParams {
-        name: "horos/r1/iteration".into(),
+        name: name.into(),
         argv: vec![
             "claude".into(),
             "--dangerously-skip-permissions".into(),
@@ -112,7 +126,10 @@ fn agent_start_sends_the_protocol_20_shape() {
 
     let seen: Vec<_> = rx.iter().collect();
     let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
-    assert_eq!(methods, ["ping", "tab.create", "agent.start"]);
+    assert_eq!(
+        methods,
+        ["ping", "tab.create", "agent.start", "pane.rename"]
+    );
 
     // cwd + env moved onto tab.create: agent.start no longer accepts either.
     let tab = &seen[1].1;
@@ -123,7 +140,10 @@ fn agent_start_sends_the_protocol_20_shape() {
 
     // The shape that broke: `kind` + `pane_id` + `args`, and no protocol-16 leftovers.
     let start = &seen[2].1;
-    assert_eq!(start["name"], "horos/r1/iteration");
+    // The path is NOT the wire name: herdr validates `^[a-z][a-z0-9_-]{0,31}$`, so `/` alone
+    // is fatal (`invalid_agent_name`).
+    assert_eq!(start["name"], "horos-r1-iteration");
+    assert!(is_valid_herdr_agent_name(start["name"].as_str().unwrap()));
     assert_eq!(start["kind"], "claude");
     assert_eq!(start["pane_id"], "w1:p7");
     assert_eq!(
@@ -136,6 +156,39 @@ fn agent_start_sends_the_protocol_20_shape() {
             "agent.start must not carry `{gone}` under protocol 20"
         );
     }
+
+    // herdr 0.7.2's agent.start also set the pane's manual label; 0.8.0 does not, and orcr
+    // matches orphan panes by label during crash recovery — so orcr restores it, with the
+    // full unmangled path rather than the mangled agent name.
+    let rename = &seen[3].1;
+    assert_eq!(rename["pane_id"], "w1:p7");
+    assert_eq!(rename["label"], "horos/r1/iteration");
+
+    h.join().unwrap();
+}
+
+#[test]
+fn agent_start_sends_a_legal_name_for_a_uuid_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("stub_uuid.sock");
+    let (h, rx) = spawn_stub(sock.clone());
+
+    let driver = HerdrDriver::connect(&sock).expect("handshake");
+    let raw = "01a0455e-912e-7f00-9589-132466d176a0";
+    driver
+        .agent_start(&params_named(raw))
+        .expect("agent.start");
+
+    let seen: Vec<_> = rx.iter().collect();
+    let start = &seen[2].1;
+    let name = start["name"].as_str().unwrap();
+    assert_ne!(name, raw, "the raw uuid is not a legal herdr agent name");
+    assert!(
+        is_valid_herdr_agent_name(name),
+        "`{name}` would be rejected with invalid_agent_name"
+    );
+    // The label still carries the caller's original string.
+    assert_eq!(seen[3].1["label"], raw);
 
     h.join().unwrap();
 }

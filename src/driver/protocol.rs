@@ -261,7 +261,80 @@ pub struct AgentStartParams {
     pub workspace_id: Option<String>,
 }
 
+/// The maximum length herdr allows for an agent `name`.
+const MAX_AGENT_NAME: usize = 32;
+
+/// FNV-1a (64-bit). Hand-rolled rather than `DefaultHasher` because the derived agent name
+/// must be **stable forever** — same path, same name, across processes and Rust releases.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// True if `name` satisfies herdr's `valid_agent_name`: `^[a-z][a-z0-9_-]{0,31}$`.
+pub fn is_valid_herdr_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('a'..='z'))
+        && name.len() <= MAX_AGENT_NAME
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+}
+
 impl AgentStartParams {
+    /// The herdr agent `name` for this launch.
+    ///
+    /// herdr requires `^[a-z][a-z0-9_-]{0,31}$`, but orcr addresses agents by path: `/`-joined
+    /// `[a-z0-9_]{1,64}` segments (`path::valid_segment`). Such a path carries `/`, may start
+    /// with a digit, and routinely exceeds 32 characters — all three are rejected with
+    /// `invalid_agent_name`.
+    ///
+    /// The derivation must stay **injective**, because herdr enforces session-global name
+    /// uniqueness (`agent_name_taken`) while orcr only guarantees that its *paths* are unique.
+    ///
+    /// - `/` -> `-` is injective on its own: `-` cannot occur inside a path segment, so the
+    ///   dashed form round-trips to exactly one path. When it is already legal it is used
+    ///   verbatim, which keeps `herdr agent list` readable — this is the case for ordinary
+    ///   paths like `horos/r1/iteration` -> `horos-r1-iteration`.
+    /// - Otherwise the name is `<head>--<hash>`. A dashed path can never contain `--` (that
+    ///   would need an empty segment, which `valid_segment` rejects), so a derived name can
+    ///   never collide with a verbatim one, and `<hash>` is a stable 64-bit FNV-1a of the
+    ///   full original name.
+    pub fn herdr_agent_name(&self) -> String {
+        let slug: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                    c
+                } else {
+                    // `/` is the separator; anything else illegal folds the same way and is
+                    // disambiguated by the hash below.
+                    '-'
+                }
+            })
+            .collect();
+        if is_valid_herdr_agent_name(&slug) {
+            return slug;
+        }
+
+        // 16 hex of hash + the 2-char `--` marker leaves 14 characters of readable head.
+        let mut head = slug;
+        if !head.starts_with(|c: char| c.is_ascii_lowercase()) {
+            head.insert(0, 'a');
+        }
+        head.truncate(MAX_AGENT_NAME - 18);
+        while head.ends_with('-') || head.ends_with('_') {
+            head.pop();
+        }
+        if head.is_empty() {
+            head.push('a');
+        }
+        format!("{head}--{:016x}", fnv1a64(self.name.as_bytes()))
+    }
+
     /// Split `argv` into herdr's `(kind, args)`. herdr resolves the executable from `kind`
     /// (`detect::interactive_agent_executable`), so `argv[0]` must be a label herdr knows —
     /// which is exactly what the built-in integrations emit.
@@ -399,6 +472,98 @@ mod tests {
         let (kind, args) = p.split_argv().unwrap();
         assert_eq!(kind, "claude");
         assert_eq!(args, ["--dangerously-skip-permissions", "--model", "opus"]);
+    }
+
+    fn named(name: &str) -> AgentStartParams {
+        AgentStartParams {
+            name: name.into(),
+            argv: vec!["claude".into()],
+            cwd: None,
+            env: Default::default(),
+            focus: false,
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn herdr_agent_name_is_always_legal() {
+        for name in [
+            "horos/r1/iteration",
+            "horos/ri0vf6/iteration",
+            // The three ways an orcr path violates herdr's rule.
+            "review_a/fanout/file_0",
+            "0review/worker",
+            "01a0455e-912e-7f00-9589-132466d176a0",
+            "a/very/deeply/nested/path/that/is/definitely/longer/than/thirty_two",
+            "9",
+            "_",
+            "worker",
+        ] {
+            let got = named(name).herdr_agent_name();
+            assert!(
+                is_valid_herdr_agent_name(&got),
+                "`{name}` derived `{got}`, which herdr would reject"
+            );
+        }
+    }
+
+    #[test]
+    fn herdr_agent_name_keeps_ordinary_paths_readable() {
+        assert_eq!(named("worker").herdr_agent_name(), "worker");
+        assert_eq!(
+            named("horos/ri0vf6/iteration").herdr_agent_name(),
+            "horos-ri0vf6-iteration"
+        );
+        assert_eq!(
+            named("review_a/fanout/file_0").herdr_agent_name(),
+            "review_a-fanout-file_0"
+        );
+    }
+
+    #[test]
+    fn herdr_agent_name_rewrites_a_uuid() {
+        // A raw uuid violates two rules at once: it starts with a digit and it is 36 chars.
+        let got = named("01a0455e-912e-7f00-9589-132466d176a0").herdr_agent_name();
+        assert!(is_valid_herdr_agent_name(&got));
+        assert_ne!(got, "01a0455e-912e-7f00-9589-132466d176a0");
+        assert!(got.contains("--"), "derived names carry the `--` marker: {got}");
+    }
+
+    #[test]
+    fn herdr_agent_name_is_deterministic() {
+        for name in ["horos/r1/iteration", "0review/worker", "x".repeat(80).as_str()] {
+            assert_eq!(
+                named(name).herdr_agent_name(),
+                named(name).herdr_agent_name()
+            );
+        }
+    }
+
+    #[test]
+    fn herdr_agent_name_is_injective_over_paths() {
+        // herdr enforces session-global name uniqueness, so distinct paths must not collide —
+        // including a path whose segments contain the `_` that survives the `/` -> `-` fold.
+        let paths = [
+            "a/b",
+            "a_b",
+            "ab",
+            "a/b/c",
+            "a/bc",
+            "ab/c",
+            "review_a/fanout/file_0",
+            "review/a_fanout/file_0",
+            "0review/worker",
+            "review/worker",
+            "a/very/deeply/nested/path/that/is/definitely/longer/than/thirty_two",
+            "a/very/deeply/nested/path/that/is/definitely/longer/than/thirty_three",
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for p in paths {
+            let name = named(p).herdr_agent_name();
+            if let Some(prev) = seen.insert(name.clone(), p) {
+                panic!("`{p}` and `{prev}` both derive `{name}`");
+            }
+        }
     }
 
     #[test]

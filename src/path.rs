@@ -182,14 +182,19 @@ pub fn home_workspace(path: &str) -> String {
     }
 }
 
-/// The herdr agent `name` (and pane `label`) for a path. herdr 0.7.2 enforces that an
+/// The herdr pane `label` for a path. herdr 0.7.2 enforces that an
 /// agent's `name` is **unique across the whole session**, not scoped to its workspace, so the
 /// tab label (the path after the first segment) is *not* usable as the herdr name: two
 /// agents in different top-level scopes (e.g. `review_a/fanout/file_0` and
 /// `review_b/fanout/file_0`) would collide with `agent_name_taken`. orcr already guarantees
 /// full paths are unique among active agents, so the **full effective path** is the correct
-/// session-unique herdr name. (This is why the visible tab shows the full path rather than
+/// session-unique identity. (This is why the visible tab shows the full path rather than
 /// the path-after-first-segment.)
+///
+/// This is the *label* only. Since herdr 0.8.0 the agent `name` is validated as
+/// `^[a-z][a-z0-9_-]{0,31}$`, which no `/`-joined path satisfies, so the wire name is derived
+/// separately — see [`crate::driver::AgentStartParams::herdr_agent_name`]. Labels are
+/// free-form, so they keep the readable full path.
 pub fn herdr_name(path: &str) -> String {
     path.to_string()
 }
